@@ -1,0 +1,399 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import os
+import threading
+from pathlib import Path
+import pandas as pd
+import PyPDF2
+import fitz  # PyMuPDF
+from datetime import datetime
+
+class PDFCommentScanner:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PDF Comment Scanner")
+        self.root.geometry("600x400")
+        self.root.resizable(True, True)
+        
+        # Variables
+        self.folder_path = tk.StringVar()
+        self.include_subfolders = tk.BooleanVar(value=False)  # Default: no subfolders
+        self.scanning = False
+        
+        self.setup_ui()
+        
+    def setup_ui(self):
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        # Configure grid weights
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        main_frame.columnconfigure(1, weight=1)
+        
+        # Title
+        title_label = ttk.Label(main_frame, text="PDF Comment Scanner", 
+                               font=("Arial", 16, "bold"))
+        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+        
+        # Folder selection row
+        folder_frame = ttk.Frame(main_frame)
+        folder_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        folder_frame.columnconfigure(1, weight=1)
+        
+        ttk.Label(folder_frame, text="Select Folder:").grid(row=0, column=0, sticky=tk.W)
+        
+        folder_entry = ttk.Entry(folder_frame, textvariable=self.folder_path, width=50)
+        folder_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(10, 5))
+        
+        browse_btn = ttk.Button(folder_frame, text="Browse", command=self.browse_folder)
+        browse_btn.grid(row=0, column=2, padx=(5, 10))
+        
+        # Subfolder checkbox
+        subfolder_check = ttk.Checkbutton(folder_frame, text="Include subfolders", 
+                                         variable=self.include_subfolders)
+        subfolder_check.grid(row=0, column=3, padx=(5, 0))
+        
+        # Progress bar
+        self.progress_var = tk.DoubleVar()
+        self.progress_bar = ttk.Progressbar(main_frame, variable=self.progress_var, 
+                                          maximum=100, length=400)
+        self.progress_bar.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), 
+                              pady=(20, 10))
+        
+        # Status label
+        self.status_var = tk.StringVar(value="Ready to scan...")
+        status_label = ttk.Label(main_frame, textvariable=self.status_var)
+        status_label.grid(row=3, column=0, columnspan=3, pady=5)
+        
+        # Results text area
+        results_frame = ttk.LabelFrame(main_frame, text="Scan Results", padding="5")
+        results_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), 
+                          pady=(20, 10))
+        results_frame.columnconfigure(0, weight=1)
+        results_frame.rowconfigure(0, weight=1)
+        main_frame.rowconfigure(4, weight=1)
+        
+        self.results_text = tk.Text(results_frame, height=15, wrap=tk.WORD)
+        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, 
+                                 command=self.results_text.yview)
+        self.results_text.configure(yscrollcommand=scrollbar.set)
+        
+        self.results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        
+        # Buttons frame
+        buttons_frame = ttk.Frame(main_frame)
+        buttons_frame.grid(row=5, column=0, columnspan=3, pady=(10, 0))
+        
+        self.scan_btn = ttk.Button(buttons_frame, text="Start Scan", 
+                                  command=self.start_scan)
+        self.scan_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.export_btn = ttk.Button(buttons_frame, text="Export to Excel", 
+                                   command=self.export_to_excel, state=tk.DISABLED)
+        self.export_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.clear_btn = ttk.Button(buttons_frame, text="Clear Results", 
+                                   command=self.clear_results)
+        self.clear_btn.pack(side=tk.LEFT)
+        
+        # Store results with file sizes
+        self.files_with_comments = []
+        self.secured_files = []
+        self.large_files = []
+        self.file_sizes = {}  # Dictionary to store file sizes
+        
+    def browse_folder(self):
+        folder = filedialog.askdirectory(title="Select folder containing PDF files")
+        if folder:
+            self.folder_path.set(folder)
+            
+    def log_message(self, message):
+        """Add message to results text area"""
+        self.results_text.insert(tk.END, f"{datetime.now().strftime('%H:%M:%S')} - {message}\n")
+        self.results_text.see(tk.END)
+        self.root.update_idletasks()
+        
+    def check_pdf_for_comments_pypdf2(self, pdf_path):
+        """Check PDF for comments using PyPDF2"""
+        try:
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                # Check if file is encrypted/secured
+                if reader.is_encrypted:
+                    return False, True  # No comments checked, but is secured
+                
+                for page in reader.pages:
+                    if '/Annots' in page:
+                        annotations = page['/Annots']
+                        if annotations and len(annotations) > 0:
+                            return True, False  # Has comments, not secured
+            return False, False  # No comments, not secured
+        except Exception as e:
+            self.log_message(f"PyPDF2 error with {os.path.basename(pdf_path)}: {str(e)}")
+            return False, False
+            
+    def check_pdf_for_comments_pymupdf(self, pdf_path):
+        """Check PDF for comments using PyMuPDF (more reliable)"""
+        try:
+            doc = fitz.open(pdf_path)
+            is_secured = doc.needs_pass  # Check if password protected
+            
+            if is_secured:
+                doc.close()
+                return False, True  # Can't check comments, but is secured
+                
+            has_comments = False
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                annotations = page.annots()
+                if annotations:
+                    for annot in annotations:
+                        # Check for various annotation types (comments, stamps, sticky notes)
+                        annot_type = annot.type[1]  # Get annotation type
+                        if annot_type in ['Text', 'FreeText', 'Highlight', 'Underline', 
+                                        'Strikeout', 'Squiggly', 'Note', 'Stamp', 'Ink']:
+                            has_comments = True
+                            break
+                if has_comments:
+                    break
+            doc.close()
+            return has_comments, False  # Has/doesn't have comments, not secured
+        except Exception as e:
+            self.log_message(f"PyMuPDF error with {os.path.basename(pdf_path)}: {str(e)}")
+            return False, False
+            
+    def check_pdf_for_comments(self, pdf_path):
+        """Check PDF for comments using both libraries for better coverage"""
+        # Try PyMuPDF first (more reliable)
+        has_comments_mupdf, is_secured_mupdf = self.check_pdf_for_comments_pymupdf(pdf_path)
+        
+        # If secured by PyMuPDF, return immediately
+        if is_secured_mupdf:
+            return False, True
+            
+        # If no comments found and not secured, try PyPDF2 as backup
+        if not has_comments_mupdf:
+            has_comments_pypdf2, is_secured_pypdf2 = self.check_pdf_for_comments_pypdf2(pdf_path)
+            return has_comments_pypdf2, is_secured_pypdf2
+            
+        return has_comments_mupdf, False
+        
+    def scan_folder(self):
+        """Scan folder for PDF files with comments"""
+        folder = self.folder_path.get()
+        if not folder or not os.path.exists(folder):
+            messagebox.showerror("Error", "Please select a valid folder")
+            return
+            
+        self.scanning = True
+        self.scan_btn.config(state=tk.DISABLED, text="Scanning...")
+        self.export_btn.config(state=tk.DISABLED)
+        self.files_with_comments = []
+        self.secured_files = []
+        self.large_files = []
+        self.file_sizes = {}
+        
+        # Find all PDF files
+        pdf_files = []
+        if self.include_subfolders.get():
+            # Scan subfolders recursively
+            for root, dirs, files in os.walk(folder):
+                for file in files:
+                    if file.lower().endswith('.pdf'):
+                        pdf_files.append(os.path.join(root, file))
+        else:
+            # Scan only the main folder (no subfolders)
+            for file in os.listdir(folder):
+                file_path = os.path.join(folder, file)
+                if os.path.isfile(file_path) and file.lower().endswith('.pdf'):
+                    pdf_files.append(file_path)
+        
+        if not pdf_files:
+            subfolder_text = "and subfolders" if self.include_subfolders.get() else ""
+            self.log_message(f"No PDF files found in the selected folder {subfolder_text}.")
+            self.scanning = False
+            self.scan_btn.config(state=tk.NORMAL, text="Start Scan")
+            return
+            
+        subfolder_text = "including subfolders" if self.include_subfolders.get() else "in main folder only"
+        self.log_message(f"Found {len(pdf_files)} PDF files ({subfolder_text}). Starting scan...")
+        
+        total_files = len(pdf_files)
+        processed = 0
+        
+        for pdf_path in pdf_files:
+            if not self.scanning:  # Check if scan was cancelled
+                break
+                
+            filename = os.path.basename(pdf_path)
+            self.status_var.set(f"Scanning: {filename}")
+            
+            try:
+                # Check file size (10 MB = 10 * 1024 * 1024 bytes)
+                file_size = os.path.getsize(pdf_path)
+                file_size_mb = file_size / (1024 * 1024)  # Convert to MB
+                is_large = file_size > 10 * 1024 * 1024  # 10 MB threshold
+                
+                # Store file size for later use
+                self.file_sizes[filename] = file_size_mb
+                
+                has_comments, is_secured = self.check_pdf_for_comments(pdf_path)
+                
+                # Track different file types
+                if is_large:
+                    self.large_files.append(filename)
+                    
+                if is_secured:
+                    self.secured_files.append(filename)
+                    self.log_message(f"🔒 Password protected: {filename} ({file_size_mb:.1f} MB)")
+                elif has_comments:
+                    self.files_with_comments.append(filename)
+                    if is_large:
+                        self.log_message(f"✓📁 Comments found (Large file): {filename} ({file_size_mb:.1f} MB)")
+                    else:
+                        self.log_message(f"✓ Comments found: {filename} ({file_size_mb:.1f} MB)")
+                else:
+                    if is_large:
+                        self.log_message(f"○📁 Large file, no comments: {filename} ({file_size_mb:.1f} MB)")
+                    else:
+                        self.log_message(f"○ No comments: {filename} ({file_size_mb:.1f} MB)")
+                    
+            except Exception as e:
+                self.log_message(f"✗ Error scanning {filename}: {str(e)}")
+                
+            processed += 1
+            progress = (processed / total_files) * 100
+            self.progress_var.set(progress)
+            
+        # Scan complete
+        self.scanning = False
+        self.scan_btn.config(state=tk.NORMAL, text="Start Scan")
+        
+        if self.files_with_comments or self.secured_files or self.large_files:
+            self.export_btn.config(state=tk.NORMAL)
+            self.log_message(f"\n=== SCAN COMPLETE ===")
+            self.log_message(f"Files with comments: {len(self.files_with_comments)}")
+            self.log_message(f"Password protected files: {len(self.secured_files)}")
+            self.log_message(f"Large files (>10 MB): {len(self.large_files)}")
+            self.log_message(f"Regular files: {total_files - len(set(self.files_with_comments + self.secured_files + self.large_files))}")
+            self.status_var.set(f"Scan complete. Found {len(self.files_with_comments)} with comments, {len(self.secured_files)} secured, {len(self.large_files)} large files.")
+        else:
+            self.log_message(f"\n=== SCAN COMPLETE ===")
+            self.log_message("No PDF files with comments, security, or large size found.")
+            self.status_var.set("Scan complete. No special files found.")
+            
+    def start_scan(self):
+        """Start scanning in a separate thread"""
+        if not self.folder_path.get():
+            messagebox.showerror("Error", "Please select a folder first")
+            return
+            
+        self.clear_results()
+        thread = threading.Thread(target=self.scan_folder, daemon=True)
+        thread.start()
+        
+    def export_to_excel(self):
+        """Export results to Excel file"""
+        if not self.files_with_comments and not self.secured_files and not self.large_files:
+            messagebox.showwarning("Warning", "No files with comments, security, or large size to export")
+            return
+            
+        self.log_message("Opening file save dialog...")
+        
+        # Ask user where to save the file
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".xlsx",
+            filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+            title="Save Excel Report",
+            initialfile=f"PDF_Analysis_Report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        )
+        
+        if filename:
+            self.log_message(f"Attempting to save to: {filename}")
+            try:
+                # Determine the maximum length for creating equal-length lists
+                max_length = max(len(self.files_with_comments), len(self.secured_files), len(self.large_files))
+                
+                # Create equal-length lists by padding with empty strings
+                comments_list = self.files_with_comments + [''] * (max_length - len(self.files_with_comments))
+                secured_list = self.secured_files + [''] * (max_length - len(self.secured_files))
+                large_files_list = self.large_files + [''] * (max_length - len(self.large_files))
+                
+                # Create DataFrame with three columns - only file names
+                df = pd.DataFrame({
+                    'Files with Comments': comments_list,
+                    'Secured': secured_list,
+                    'Large Files (>10MB)': large_files_list
+                })
+                
+                # Remove rows where all columns are empty
+                df = df.loc[~((df['Files with Comments'] == '') & 
+                            (df['Secured'] == '') & 
+                            (df['Large Files (>10MB)'] == ''))]
+                
+                # Save to Excel
+                df.to_excel(filename, index=False, engine='openpyxl')
+                
+                # Verify file was created
+                if os.path.exists(filename):
+                    file_size = os.path.getsize(filename)
+                    self.log_message(f"✓ Excel report saved successfully: {filename}")
+                    self.log_message(f"✓ File size: {file_size} bytes")
+                    messagebox.showinfo("Success", 
+                                      f"Excel report saved successfully!\n\n"
+                                      f"Location: {filename}\n"
+                                      f"Files with comments: {len(self.files_with_comments)}\n"
+                                      f"Secured files: {len(self.secured_files)}\n"
+                                      f"Large files (>10MB): {len(self.large_files)}")
+                else:
+                    self.log_message("✗ File was not created!")
+                    messagebox.showerror("Error", "File was not created. Check permissions.")
+                
+            except PermissionError:
+                error_msg = "Permission denied. Close Excel if the file is open, or choose a different location."
+                self.log_message(f"✗ {error_msg}")
+                messagebox.showerror("Permission Error", error_msg)
+            except Exception as e:
+                error_msg = f"Error saving Excel file: {str(e)}"
+                self.log_message(f"✗ {error_msg}")
+                messagebox.showerror("Error", error_msg)
+        else:
+            self.log_message("Export cancelled by user.")
+                
+    def clear_results(self):
+        """Clear the results text area"""
+        self.results_text.delete(1.0, tk.END)
+        self.progress_var.set(0)
+        self.status_var.set("Ready to scan...")
+        self.files_with_comments = []
+        self.secured_files = []
+        self.large_files = []
+        self.file_sizes = {}
+        self.export_btn.config(state=tk.DISABLED)
+
+def main():
+    # Check if required libraries are available
+    try:
+        import PyPDF2
+        import fitz
+        import pandas
+    except ImportError as e:
+        tk.messagebox.showerror("Missing Dependencies", 
+                               f"Required library not found: {e}\n\n"
+                               "Please install the required libraries:\n"
+                               "pip install PyPDF2 PyMuPDF pandas openpyxl")
+        return
+    
+    root = tk.Tk()
+    app = PDFCommentScanner(root)
+    
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == "__main__":
+    main()
